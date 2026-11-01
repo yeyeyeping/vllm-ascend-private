@@ -1386,6 +1386,9 @@ def _setup_compile_backend(
             [
                 "vllm::mla_forward",
                 "vllm::dsa_forward",
+                # MiniMax sparse attention consumes per-step metadata outside piecewise graphs.
+                "vllm::minimax_m3_sparse_forward",
+                "vllm::minimax_m3_fused_sparse_forward",
             ]
         )
         additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
