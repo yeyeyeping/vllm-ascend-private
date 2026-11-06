@@ -37,6 +37,14 @@ def dummy_free(ptr):
 
 
 class TestCaMem(PytestBase):
+    @pytest.fixture(autouse=True)
+    def mock_npu_runtime(self):
+        with (
+            patch("vllm_ascend.device_allocator.camem.torch.npu.synchronize"),
+            patch("vllm_ascend.device_allocator.camem.torch.npu.empty_cache"),
+        ):
+            yield
+
     @pytest.mark.parametrize(
         "handle",
         [
@@ -106,7 +114,7 @@ class TestCaMem(PytestBase):
         assert data.cpu_backup_tensor is None
 
     @patch("vllm_ascend.device_allocator.camem.unmap_and_release")
-    @patch("vllm_ascend.device_allocator.camem.memcpy")
+    @patch("vllm_ascend.device_allocator.camem.memcpy", return_value=0)
     def test_sleep_offload_and_discard(self, mock_memcpy, mock_unmap):
         allocator = CaMemAllocator.get_instance()
 
@@ -120,17 +128,9 @@ class TestCaMem(PytestBase):
             2000: data2,
         }
 
-        # Mock torch.empty to force pin_memory=False
-        original_torch_empty = torch.empty
-
-        def mock_torch_empty(*args, **kwargs):
-            # If pin_memory was explicitly set to True, change it to False
-            if "pin_memory" in kwargs and kwargs["pin_memory"] is True:
-                kwargs["pin_memory"] = False
-            return original_torch_empty(*args, **kwargs)
-
-        with patch("vllm_ascend.device_allocator.camem.torch.empty", side_effect=mock_torch_empty):
+        with patch("vllm_ascend.device_allocator.camem.torch.empty", wraps=torch.empty) as mock_empty:
             allocator.sleep(offload_tags="tag1")
+        assert mock_empty.call_args.kwargs["pin_memory"] is False
 
         # only offload tag1, other tag2 call unmap_and_release
         assert data1.cpu_backup_tensor is not None
@@ -138,10 +138,10 @@ class TestCaMem(PytestBase):
         mock_unmap.assert_any_call(handle1)
         mock_unmap.assert_any_call(handle2)
         assert mock_unmap.call_count == 2
-        assert mock_memcpy.called
+        mock_memcpy.assert_called_once_with(data1.cpu_backup_tensor.data_ptr(), 10, 1000, 10, 2)
 
     @patch("vllm_ascend.device_allocator.camem.create_and_map")
-    @patch("vllm_ascend.device_allocator.camem.memcpy")
+    @patch("vllm_ascend.device_allocator.camem.memcpy", return_value=0)
     def test_wake_up_loads_and_clears_cpu_backup(self, mock_memcpy, mock_create_and_map):
         allocator = CaMemAllocator.get_instance()
 
@@ -154,7 +154,34 @@ class TestCaMem(PytestBase):
 
         mock_create_and_map.assert_called_once_with(handle)
         assert data.cpu_backup_tensor is None
-        assert mock_memcpy.called
+        mock_memcpy.assert_called_once_with(1000, 5, tensor.data_ptr(), 5, 1)
+
+    @patch("vllm_ascend.device_allocator.camem.unmap_and_release")
+    @patch("vllm_ascend.device_allocator.camem.memcpy", return_value=17)
+    def test_sleep_copy_failure_keeps_device_allocation(self, mock_memcpy, mock_unmap):
+        allocator = CaMemAllocator()
+        data = AllocationData((1, 10, 1000, 0), "weights")
+        allocator.pointer_to_data = {1000: data}
+
+        with pytest.raises(RuntimeError, match="device-to-host backup failed: 17"):
+            allocator.sleep(offload_tags="weights")
+
+        mock_unmap.assert_not_called()
+        assert data.cpu_backup_tensor is None
+
+    @patch("vllm_ascend.device_allocator.camem.create_and_map")
+    @patch("vllm_ascend.device_allocator.camem.memcpy", return_value=23)
+    def test_wake_up_copy_failure_keeps_cpu_backup(self, mock_memcpy, mock_create):
+        allocator = CaMemAllocator()
+        backup = torch.zeros(10, dtype=torch.uint8)
+        data = AllocationData((1, 10, 1000, 0), "weights", cpu_backup_tensor=backup)
+        allocator.pointer_to_data = {1000: data}
+
+        with pytest.raises(RuntimeError, match="host-to-device restore failed: 23"):
+            allocator.wake_up(tags=["weights"])
+
+        mock_create.assert_called_once_with(data.handle)
+        assert data.cpu_backup_tensor is backup
 
     def test_use_memory_pool_context_manager(self):
         allocator = CaMemAllocator.get_instance()
