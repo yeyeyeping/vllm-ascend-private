@@ -68,9 +68,38 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
 
     ctx = get_forward_context()
     if ctx.dp_metadata is None:  # single dp
+        # Ascend MC2/All2All split tokens across TP even without sequence
+        # parallelism. Restore the complete DP-local sequence before writing
+        # the slot-indexed capture buffer; otherwise only its prefix is updated.
+        if self.tp_size > 1 and _EXTRA_CTX.moe_comm_type in (
+            MoECommType.MC2,
+            MoECommType.FUSED_MC2,
+            MoECommType.ALLTOALL,
+        ):
+            prepare = _EXTRA_CTX.moe_comm_method.prepare_finalize
+            if prepare.replace_allreduce:
+                raise NotImplementedError(
+                    "Single-DP routed-experts capture with Ascend sequence parallelism "
+                    "requires an explicit shard layout"
+                )
+            token_num_per_dp = prepare.num_tokens
+            if _EXTRA_CTX.moe_comm_type == MoECommType.ALLTOALL:
+                padded_tokens = max(token_num_per_dp, self.tp_size)
+            else:
+                padded_tokens = _EXTRA_CTX.padded_num_tokens
+            gathered = torch.empty((padded_tokens, topk_ids.shape[1]), dtype=topk_ids.dtype, device=topk_ids.device)
+            # Match prepare() exactly: All2All may have unequal tensor_split
+            # chunks; MC2 has equal chunks with padding only at the global tail.
+            chunks = torch.tensor_split(gathered, self.tp_size, dim=0)
+            tp_group = get_tp_group()
+            if topk_ids.shape != chunks[tp_group.rank_in_group].shape:
+                raise AssertionError("Ascend routed-experts capture shard shape mismatch")
+            dist.all_gather(list(chunks), topk_ids, tp_group.device_group)
+            topk_ids = gathered
+        else:
+            token_num_per_dp = topk_ids.shape[0]
         start_loc = 0
-        end_loc = topk_ids.shape[0]
-        token_num_per_dp = topk_ids.shape[0]
+        end_loc = token_num_per_dp
     else:  # multi dp
         num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
         token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())

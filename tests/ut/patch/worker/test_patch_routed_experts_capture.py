@@ -227,6 +227,87 @@ class TestRoutedExpertsCapturerCapture:
 
         assert torch.all(capturer.device_buffer == 0)
 
+    @pytest.mark.parametrize("comm", ["MC2", "ALLTOALL", "FUSED_MC2"])
+    @pytest.mark.parametrize("num_tokens", [1, 5, 8, 13, 260, 264])
+    def test_single_dp_tp_shards_overwrite_all_rows(self, comm, num_tokens):
+        """Regression: DP=1 must gather TP routes, including uneven chunks."""
+        from types import SimpleNamespace
+
+        from vllm_ascend.ascend_forward_context import MoECommType
+
+        module = "vllm_ascend.patch.worker.patch_routed_experts_capture"
+        tp_size = 8
+        padded = max(num_tokens, tp_size) if comm == "ALLTOALL" else ((num_tokens + 7) // 8) * 8
+        expected = torch.arange(padded * 2, dtype=torch.int32).reshape(-1, 2)
+        shards = torch.tensor_split(expected, tp_size, dim=0)
+        prepare = SimpleNamespace(num_tokens=num_tokens, replace_allreduce=False)
+        extra = SimpleNamespace(
+            moe_comm_type=getattr(MoECommType, comm),
+            padded_num_tokens=padded,
+            moe_comm_method=SimpleNamespace(prepare_finalize=prepare),
+        )
+        for rank in range(tp_size):
+            capturer = self._create_mock_capturer(tp_size=tp_size)
+            capturer.device_buffer = torch.full((300, 10, 2), -1, dtype=torch.int32)
+            group = SimpleNamespace(rank_in_group=rank, device_group=object())
+
+            def gather(outputs, local, process_group, group=group, rank=rank):
+                assert process_group is group.device_group
+                torch.testing.assert_close(local, shards[rank])
+                for destination, source in zip(outputs, shards):
+                    destination.copy_(source)
+
+            with (
+                patch(module + ".get_forward_context", return_value=SimpleNamespace(dp_metadata=None)),
+                patch(module + "._EXTRA_CTX", extra),
+                patch(module + ".get_tp_group", return_value=group),
+                patch(module + ".dist.all_gather", side_effect=gather) as collective,
+            ):
+                capture(capturer, 3, shards[rank])
+                collective.assert_called_once()
+            torch.testing.assert_close(capturer.device_buffer[:num_tokens, 3], expected[:num_tokens])
+            assert (capturer.device_buffer[num_tokens:, 3] == -1).all()
+
+    def test_single_dp_tp_unsharded_allgather(self):
+        from types import SimpleNamespace
+
+        from vllm_ascend.ascend_forward_context import MoECommType
+
+        module = "vllm_ascend.patch.worker.patch_routed_experts_capture"
+        capturer = self._create_mock_capturer(tp_size=8)
+        routes = torch.arange(26, dtype=torch.int32).reshape(-1, 2)
+        with (
+            patch(module + ".get_forward_context", return_value=SimpleNamespace(dp_metadata=None)),
+            patch(module + "._EXTRA_CTX", SimpleNamespace(moe_comm_type=MoECommType.ALLGATHER)),
+            patch(module + ".dist.all_gather") as collective,
+        ):
+            capture(capturer, 3, routes)
+            collective.assert_not_called()
+        torch.testing.assert_close(capturer.device_buffer[:13, 3], routes)
+
+    @pytest.mark.parametrize("sp", [False, True])
+    def test_single_dp_tp_rejects_unsupported_layout(self, sp):
+        from types import SimpleNamespace
+
+        from vllm_ascend.ascend_forward_context import MoECommType
+
+        module = "vllm_ascend.patch.worker.patch_routed_experts_capture"
+        prepare = SimpleNamespace(num_tokens=13, replace_allreduce=sp)
+        extra = SimpleNamespace(
+            moe_comm_type=MoECommType.MC2,
+            padded_num_tokens=16,
+            moe_comm_method=SimpleNamespace(prepare_finalize=prepare),
+        )
+        with (
+            patch(module + ".get_forward_context", return_value=SimpleNamespace(dp_metadata=None)),
+            patch(module + "._EXTRA_CTX", extra),
+            patch(module + ".get_tp_group", return_value=SimpleNamespace(rank_in_group=0)),
+            patch(module + ".dist.all_gather") as collective,
+            pytest.raises(NotImplementedError if sp else AssertionError),
+        ):
+            capture(self._create_mock_capturer(tp_size=8), 3, torch.zeros((3, 2), dtype=torch.int32))
+        collective.assert_not_called()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
