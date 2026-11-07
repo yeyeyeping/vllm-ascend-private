@@ -19,7 +19,7 @@ def reference(packed, cos_sin, positions, weights, q_heads, kv_heads, index_head
     cs = cos_sin[positions].float().unsqueeze(1)
     for part, weight in zip((0, 1, 3, 4), weights):
         x = parts[part].reshape(packed.shape[0], -1, head_dim).float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * (1 + weight.float())
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * (1 + weight).float()
         x = x.to(packed.dtype).float()
         a, b = x[..., :half].clone(), x[..., half : 2 * half].clone()
         x[..., :half] = a * cs[..., :half] - b * cs[..., half:]
@@ -359,3 +359,48 @@ def test_layout_variants_compile_once_then_reuse(isolated_fused_kernel):
         assert jit_variant_count(kernel) == len(layouts), layout
         assert compile_spy.call_count == len(layouts), layout
     print(f"layout sweep: variants={len(layouts)}, revisit_compile_entries=0")
+
+
+@pytest.mark.parametrize("tokens", [1, 512])
+@torch.inference_mode()
+def test_norm_weight_dtype_rounding_matches_unfused(tokens):
+    import torch_npu
+
+    torch.manual_seed(20261107)
+    hd, block = 128, 128
+    packed = torch.randn(tokens, 12 * hd, dtype=torch.bfloat16).npu()
+    weights = [torch.zeros(hd, dtype=packed.dtype, device="npu") for _ in range(4)]
+    cs = torch.cat((torch.ones(tokens, 32), torch.zeros(tokens, 32)), -1).to(packed.dtype).npu()
+    positions = torch.arange(tokens, device="npu")
+    blocks = (tokens + block - 1) // block
+    key = torch.zeros(blocks, block, 1, hd, dtype=packed.dtype, device="npu")
+    value = torch.zeros_like(key)
+    index = torch.zeros(blocks, block, hd, dtype=packed.dtype, device="npu")
+    for update in range(2):
+        # Refit the same parameter storage: no stale derived scale is allowed.
+        for weight in weights:
+            weight.copy_((torch.randn(hd) * (0.1 + 0.2 * update)).to(packed.dtype).npu())
+        q, iq = minimax_qknorm_rope_cache(
+            packed,
+            cs,
+            positions,
+            *weights,
+            key,
+            value,
+            index,
+            positions,
+            positions,
+            tokens,
+            8,
+            1,
+            1,
+            1e-6,
+        )
+        parts = packed.split([8 * hd, hd, hd, hd, hd], -1)
+        actual = (q, key.view(-1, hd)[:tokens], iq, index.view(-1, hd)[:tokens])
+        for output, part, weight in zip(actual, (0, 1, 3, 4), weights):
+            x = parts[part].reshape(tokens, -1, hd).contiguous()
+            expected = torch_npu.npu_rms_norm(x, 1.0 + weight, 1e-6)[0].reshape_as(output)
+            # A few final BF16 rounding boundaries can differ across norm kernels;
+            # retaining FP32 1+weight produces a much larger systematic error.
+            assert (output.float() - expected.float()).abs().mean().item() < 2e-6

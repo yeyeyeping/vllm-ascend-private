@@ -34,8 +34,12 @@ def _norm_rope(
     x = tl.load(input_ptr + heads[:, None] * HEAD_DIM + cols[None, :]).to(tl.float32)
     weight = tl.load(weight_ptr + cols).to(tl.float32)
     other_weight = tl.load(other_weight_ptr + cols).to(tl.float32)
+    # Match the unfused Gemma norm: round 1 + weight in its storage dtype
+    # before the FP32 normalization multiply (including index Q/K norms).
+    weight = (1.0 + weight).to(weight_ptr.dtype.element_ty).to(tl.float32)
+    other_weight = (1.0 + other_weight).to(other_weight_ptr.dtype.element_ty).to(tl.float32)
     weight = tl.where(heads[:, None] < SPLIT_HEADS, weight[None, :], other_weight[None, :])
-    x = x * tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)[:, None] * (1.0 + weight)
+    x = x * tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)[:, None] * weight
     x = x.to(input_ptr.dtype.element_ty).to(tl.float32)
     half: tl.constexpr = ROTARY_DIM // 2
     cos = tl.load(cos_sin_ptr + tl.arange(0, half)).to(tl.float32)
