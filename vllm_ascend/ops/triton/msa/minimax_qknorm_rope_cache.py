@@ -13,6 +13,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import extract_slice, insert_slice
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 FP8_E4M3_MAX = tl.constexpr(448.0)
 
@@ -28,18 +29,20 @@ def _norm_rope(
     EPS: tl.constexpr,
     other_weight_ptr,
     SPLIT_HEADS: tl.constexpr,
+    ROUND_WEIGHT_OFFSET: tl.constexpr,
 ):
     cols = tl.arange(0, HEAD_DIM)
     heads = tl.arange(0, HEADS)
     x = tl.load(input_ptr + heads[:, None] * HEAD_DIM + cols[None, :]).to(tl.float32)
     weight = tl.load(weight_ptr + cols).to(tl.float32)
     other_weight = tl.load(other_weight_ptr + cols).to(tl.float32)
-    # Match the unfused Gemma norm: round 1 + weight in its storage dtype
-    # before the FP32 normalization multiply (including index Q/K norms).
-    weight = (1.0 + weight).to(weight_ptr.dtype.element_ty).to(tl.float32)
-    other_weight = (1.0 + other_weight).to(other_weight_ptr.dtype.element_ty).to(tl.float32)
     weight = tl.where(heads[:, None] < SPLIT_HEADS, weight[None, :], other_weight[None, :])
-    x = x * tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)[:, None] * weight
+    scale = 1.0 + weight
+    if ROUND_WEIGHT_OFFSET:
+        # A5 uses npu_rms_norm(x, 1.0 + weight): round the offset
+        # in the parameter dtype before scaling, just like the unfused path.
+        scale = scale.to(weight_ptr.dtype.element_ty).to(tl.float32)
+    x = x * tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)[:, None] * scale
     x = x.to(input_ptr.dtype.element_ty).to(tl.float32)
     half: tl.constexpr = ROTARY_DIM // 2
     cos = tl.load(cos_sin_ptr + tl.arange(0, half)).to(tl.float32)
@@ -94,13 +97,16 @@ def _minimax_qknorm_rope_cache_kernel(
     INDEX_BLOCK_SIZE: tl.constexpr,
     CACHE_FP8: tl.constexpr,
     INDEX_FP8: tl.constexpr,
+    ROUND_WEIGHT_OFFSET: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     position = tl.load(positions + token * POSITION_STRIDE).to(tl.int64)
     cs = cos_sin + position * COS_SIN_STRIDE
     dim = tl.arange(0, HEAD_DIM)
     row = packed + token * INPUT_STRIDE
-    qk = _norm_rope(row, q_weight, cs, Q_HEADS + KV_HEADS, HEAD_DIM, ROTARY_DIM, EPS, k_weight, Q_HEADS)
+    qk = _norm_rope(
+        row, q_weight, cs, Q_HEADS + KV_HEADS, HEAD_DIM, ROTARY_DIM, EPS, k_weight, Q_HEADS, ROUND_WEIGHT_OFFSET
+    )
     q = extract_slice(qk, (0, 0), (Q_HEADS, HEAD_DIM), (1, 1))
     offsets = token * Q_HEADS * HEAD_DIM + tl.arange(0, Q_HEADS)[:, None] * HEAD_DIM + dim[None, :]
     tl.store(query + offsets, q)
@@ -117,7 +123,9 @@ def _minimax_qknorm_rope_cache_kernel(
         tl.store(key_cache + k_offset + tl.arange(0, KV_HEADS)[:, None] * K_HEAD + dim[None, :], k)
         tl.store(value_cache + v_offset + tl.arange(0, KV_HEADS)[:, None] * V_HEAD + dim[None, :], v)
     row = index_packed + token * INDEX_INPUT_STRIDE + INDEX_OFFSET
-    iqk = _norm_rope(row, iq_weight, cs, IQ_HEADS + 1, HEAD_DIM, ROTARY_DIM, EPS, ik_weight, IQ_HEADS)
+    iqk = _norm_rope(
+        row, iq_weight, cs, IQ_HEADS + 1, HEAD_DIM, ROTARY_DIM, EPS, ik_weight, IQ_HEADS, ROUND_WEIGHT_OFFSET
+    )
     if INDEX_FP8:
         iqk = tl.minimum(tl.maximum(iqk, -FP8_E4M3_MAX), FP8_E4M3_MAX)
     iq = extract_slice(iqk, (0, 0), (IQ_HEADS, HEAD_DIM), (1, 1))
@@ -228,6 +236,7 @@ def minimax_qknorm_rope_cache(
         index_cache.shape[1],
         key_cache.dtype == torch.float8_e4m3fn,
         index_cache.dtype == torch.float8_e4m3fn,
+        get_ascend_device_type() == AscendDeviceType.A5,
         enable_fp_fusion=False,
     )
     return query, index_query

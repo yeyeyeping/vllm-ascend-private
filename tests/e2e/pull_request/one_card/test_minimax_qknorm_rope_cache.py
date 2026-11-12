@@ -9,6 +9,7 @@ from vllm.triton_utils import triton
 
 from vllm_ascend.ops.triton.msa import minimax_qknorm_rope_cache as fused_module
 from vllm_ascend.ops.triton.msa.minimax_qknorm_rope_cache import minimax_qknorm_rope_cache
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 def reference(packed, cos_sin, positions, weights, q_heads, kv_heads, index_heads, eps):
@@ -19,7 +20,8 @@ def reference(packed, cos_sin, positions, weights, q_heads, kv_heads, index_head
     cs = cos_sin[positions].float().unsqueeze(1)
     for part, weight in zip((0, 1, 3, 4), weights):
         x = parts[part].reshape(packed.shape[0], -1, head_dim).float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * (1 + weight).float()
+        scale = (1 + weight).float() if get_ascend_device_type() == AscendDeviceType.A5 else 1 + weight.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * scale
         x = x.to(packed.dtype).float()
         a, b = x[..., :half].clone(), x[..., half : 2 * half].clone()
         x[..., :half] = a * cs[..., :half] - b * cs[..., half:]
@@ -28,7 +30,7 @@ def reference(packed, cos_sin, positions, weights, q_heads, kv_heads, index_head
     return parts
 
 
-@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 64, 128, 192, 256, 513])
+@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 64, 128, 192, 256, 512, 513])
 @pytest.mark.parametrize("heads", [(8, 1, 1), (16, 2, 2), (5, 1, 3)])
 @pytest.mark.parametrize("rotary_dim", [64, 128])
 @torch.inference_mode()
@@ -361,46 +363,43 @@ def test_layout_variants_compile_once_then_reuse(isolated_fused_kernel):
     print(f"layout sweep: variants={len(layouts)}, revisit_compile_entries=0")
 
 
-@pytest.mark.parametrize("tokens", [1, 512])
+@pytest.mark.parametrize("tokens", [1, 512, 513])
 @torch.inference_mode()
-def test_norm_weight_dtype_rounding_matches_unfused(tokens):
-    import torch_npu
+def test_a5_weight_offset_matches_unfused_norm(tokens):
+    """Offset rounding must agree with A5's real RMSNorm, including cache writes."""
+    if get_ascend_device_type() != AscendDeviceType.A5:
+        pytest.skip("A5 uses a dtype-rounded weight offset")
+    from vllm_ascend.device.device_op import A5DeviceAdaptor
 
-    torch.manual_seed(20261107)
-    hd, block = 128, 128
-    packed = torch.randn(tokens, 12 * hd, dtype=torch.bfloat16).npu()
-    weights = [torch.zeros(hd, dtype=packed.dtype, device="npu") for _ in range(4)]
-    cs = torch.cat((torch.ones(tokens, 32), torch.zeros(tokens, 32)), -1).to(packed.dtype).npu()
-    positions = torch.arange(tokens, device="npu")
-    blocks = (tokens + block - 1) // block
-    key = torch.zeros(blocks, block, 1, hd, dtype=packed.dtype, device="npu")
+    hd, qh, kh, ih = 128, 8, 1, 1
+    pattern = torch.tensor([0.5, 1.5, -0.5, -1.5], dtype=torch.bfloat16, device="npu")
+    packed = pattern.repeat(tokens, 12 * hd // 4).contiguous()
+    weights = [torch.full((hd,), w, dtype=packed.dtype, device="npu") for w in (0.1, -0.1, 0.003, -0.003)]
+    # Identity RoPE isolates normalization from trigonometric rounding.
+    cs = torch.cat((torch.ones(1, 32), torch.zeros(1, 32)), dim=-1).to(device="npu", dtype=packed.dtype)
+    positions = torch.zeros(tokens, dtype=torch.int64, device="npu")
+    slots = torch.arange(tokens, dtype=torch.int64, device="npu")
+    key = torch.zeros((1, tokens, kh, hd), dtype=packed.dtype, device="npu")
     value = torch.zeros_like(key)
-    index = torch.zeros(blocks, block, hd, dtype=packed.dtype, device="npu")
-    for update in range(2):
-        # Refit the same parameter storage: no stale derived scale is allowed.
-        for weight in weights:
-            weight.copy_((torch.randn(hd) * (0.1 + 0.2 * update)).to(packed.dtype).npu())
-        q, iq = minimax_qknorm_rope_cache(
-            packed,
-            cs,
-            positions,
-            *weights,
-            key,
-            value,
-            index,
-            positions,
-            positions,
-            tokens,
-            8,
-            1,
-            1,
-            1e-6,
-        )
-        parts = packed.split([8 * hd, hd, hd, hd, hd], -1)
-        actual = (q, key.view(-1, hd)[:tokens], iq, index.view(-1, hd)[:tokens])
-        for output, part, weight in zip(actual, (0, 1, 3, 4), weights):
-            x = parts[part].reshape(tokens, -1, hd).contiguous()
-            expected = torch_npu.npu_rms_norm(x, 1.0 + weight, 1e-6)[0].reshape_as(output)
-            # A few final BF16 rounding boundaries can differ across norm kernels;
-            # retaining FP32 1+weight produces a much larger systematic error.
-            assert (output.float() - expected.float()).abs().mean().item() < 2e-6
+    index = torch.zeros((1, tokens, hd), dtype=packed.dtype, device="npu")
+    q, iq = minimax_qknorm_rope_cache(
+        packed,
+        cs,
+        positions,
+        *weights,
+        key,
+        value,
+        index,
+        slots,
+        slots,
+        tokens,
+        qh,
+        kh,
+        ih,
+        1e-6,
+    )
+    parts = packed.split([qh * hd, kh * hd, kh * hd, ih * hd, hd], -1)
+    for actual, part, weight in zip((q, key, iq, index), (parts[0], parts[1], parts[3], parts[4]), weights):
+        expected = A5DeviceAdaptor.npu_gemma_rms_norm(part.reshape(-1, hd).contiguous(), weight, 1e-6)
+        torch.testing.assert_close(actual.reshape(-1, hd), expected, rtol=0, atol=0)
+    torch.testing.assert_close(value.reshape_as(parts[2]), parts[2], rtol=0, atol=0)

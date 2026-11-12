@@ -213,12 +213,11 @@ class CaMemAllocator:
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=False)
+                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 ACL_MEMCPY_DEVICE_TO_HOST = 2
-                ret = memcpy(cpu_ptr, size_in_bytes, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
-                if ret != 0:
-                    raise RuntimeError(f"CaMem device-to-host backup failed: {ret}")
+                dest_max = cpu_ptr + size_in_bytes * 2
+                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
 
@@ -250,9 +249,8 @@ class CaMemAllocator:
                         size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         ACL_MEMCPY_HOST_TO_DEVICE = 1
-                        ret = memcpy(ptr, size_in_bytes, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
-                        if ret != 0:
-                            raise RuntimeError(f"CaMem host-to-device restore failed: {ret}")
+                        dest_max = ptr + size_in_bytes * 2
+                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
                         data.cpu_backup_tensor = None
 
     @contextmanager
